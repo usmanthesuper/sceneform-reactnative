@@ -4,6 +4,11 @@ import static com.reactnativesceneform.utils.HelperFuncions.checkIsSupportedDevi
 import static com.reactnativesceneform.utils.HelperFuncions.saveBitmapToDisk;
 import android.annotation.SuppressLint;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.ImageFormat;
+import android.graphics.Matrix;
+import android.graphics.Rect;
+import android.graphics.YuvImage;
 import android.media.CamcorderProfile;
 import android.os.Build;
 import android.os.Handler;
@@ -19,6 +24,7 @@ import com.facebook.react.bridge.Arguments;
 import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.ReadableArray;
 import com.facebook.react.bridge.ReadableMap;
+import com.facebook.react.bridge.WritableArray;
 import com.facebook.react.bridge.WritableMap;
 import com.facebook.react.uimanager.ThemedReactContext;
 import com.google.android.filament.ColorGrading;
@@ -29,13 +35,18 @@ import com.google.ar.core.HitResult;
 import com.google.ar.core.Plane;
 import com.google.ar.core.Session;
 import com.google.ar.core.TrackingState;
+import com.google.ar.core.exceptions.NotYetAvailableException;
 import com.google.ar.sceneform.AnchorNode;
 import com.google.ar.sceneform.ArSceneView;
 import com.google.ar.sceneform.Camera;
 import com.google.ar.sceneform.FrameTime;
 import com.google.ar.sceneform.Node;
+import com.google.ar.sceneform.Scene;
 import com.google.ar.sceneform.SceneView;
+import com.google.ar.sceneform.math.Quaternion;
 import com.google.ar.sceneform.rendering.EngineInstance;
+import com.google.ar.sceneform.rendering.MaterialFactory;
+import com.google.ar.sceneform.rendering.ModelRenderable;
 import com.google.ar.sceneform.rendering.Renderer;
 import com.google.ar.sceneform.ux.ArFragment;
 import com.google.ar.sceneform.ux.BaseArFragment;
@@ -44,6 +55,7 @@ import com.reactnativesceneform.R;
 import com.reactnativesceneform.utils.ModelManager;
 import com.reactnativesceneform.utils.VideoRecorder;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -52,6 +64,20 @@ import java.util.concurrent.CompletableFuture;
 import uk.co.appoly.arcorelocation.LocationScene;
 import com.google.ar.core.AugmentedImage;
 import com.google.ar.core.AugmentedImageDatabase;
+
+import android.os.Handler;
+import android.os.Looper;
+import java.io.ByteArrayOutputStream;
+import java.net.URL;
+import java.net.HttpURLConnection;
+import java.io.DataOutputStream;
+import org.json.JSONObject;
+import org.json.JSONArray;
+import com.google.ar.sceneform.Node;
+import com.google.ar.sceneform.math.Vector3;
+import com.google.ar.sceneform.rendering.Color;
+import com.google.ar.sceneform.rendering.ShapeFactory;
+import android.media.Image;
 
 @SuppressLint("ViewConstructor")
 public class ARScene extends FrameLayout implements BaseArFragment.OnTapArPlaneListener, BaseArFragment.OnSessionConfigurationListener {
@@ -73,6 +99,21 @@ public class ARScene extends FrameLayout implements BaseArFragment.OnTapArPlaneL
   private List<Anchor> mResolvingAnchors = new ArrayList<>();
   private final List<CompletableFuture<Void>> futures = new ArrayList<>();
   private boolean initialised = false;
+
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final long frameProcessingInterval = 4000L;
+    private boolean isProcessingFrame = false;
+    private final List<String> distances = new ArrayList<>();
+
+    private final Runnable frameProcessingRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!isProcessingFrame) {
+                disablePlaneRendererAndStartCapturing();
+            }
+            handler.postDelayed(this, frameProcessingInterval);
+        }
+    };
 
   private enum HostResolveMode {
     NONE,
@@ -104,6 +145,11 @@ public class ARScene extends FrameLayout implements BaseArFragment.OnTapArPlaneL
     arFragment.getArSceneView().getViewTreeObserver().addOnWindowFocusChangeListener( hasFocus -> {
       if(hasFocus){
         context.getCurrentActivity().getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN);
+          Log.d("ArSceneView","Focused Changed to true");
+          handler.post(() -> isProcessingFrame = false);
+      }else{
+          Log.d("ArSceneView","Focused Changed to false");
+          handler.post(() -> isProcessingFrame = true);
       }
     });
 
@@ -122,7 +168,345 @@ public class ARScene extends FrameLayout implements BaseArFragment.OnTapArPlaneL
     mVideoRecorder.setVideoQuality(CamcorderProfile.QUALITY_480P, orientation);
 
     initialised = true;
+    startFrameProcessing();
   }
+
+    public void sendLabelsToJS(List<String> labels) {
+        WritableMap event = Arguments.createMap();
+        WritableArray array = Arguments.createArray();
+
+        for (String label : labels) {
+            array.pushString(label);
+        }
+
+        event.putArray("distances", array);
+        ModuleWithEmitter.sendEvent(context, ModuleWithEmitter.ON_ANCHOR_RESOLVE, event);
+        distances.clear();
+    }
+
+   public void startFrameProcessing() {
+        isProcessingFrame = false;
+        handler.postDelayed(frameProcessingRunnable, frameProcessingInterval);
+    }
+
+    public void disablePlaneRendererAndStartCapturing(){
+        ArSceneView view = arFragment.getArSceneView();
+        view.getPlaneRenderer().setEnabled(false);
+
+
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            captureFrameAndPostToApi(
+                    "https://outline.roboflow.com/bocce-ball-2-eyrox/5?api_key=MQlv1Z6QF50wx2ZVwSvy",
+                    view
+            );
+        }, 300);
+    }
+
+    public void stopFrameProcessing() {
+        handler.removeCallbacks(frameProcessingRunnable);
+    }
+
+    public void captureFrameAndPostToApi(String apiUrl, ArSceneView view) {
+
+        isProcessingFrame = true;
+
+        if (view.getWindowToken() == null || !view.isAttachedToWindow()) {
+            Log.w("ARSceneView", "View is not ready for PixelCopy. Skipping frame capture.");
+            isProcessingFrame = false;
+            return;
+        }
+
+        Bitmap bitmap = Bitmap.createBitmap(view.getWidth(), view.getHeight(), Bitmap.Config.ARGB_8888);
+
+        PixelCopy.request(view, bitmap, result -> {
+            if (result == PixelCopy.SUCCESS) {
+                try {
+                    new Thread(() -> {
+                        try {
+                            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+                            bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream);
+                            byte[] imageData = outputStream.toByteArray();
+                            Log.d("ARSceneView", "Image generated successfully");
+                            handler.post(() -> view.getPlaneRenderer().setEnabled(true));
+                            sendImageToApi(apiUrl, imageData);
+//                            uploadImageToApi("http://159.65.40.253:5021/api/upload", imageData);
+                        } catch (Exception e) {
+                            Log.e("ARSceneView", "Bitmap compress failed", e);
+                            handler.post(() -> isProcessingFrame = false);
+                        }
+                    }).start();
+                } catch (Exception e) {
+                    Log.e("ARSceneView", "Error compressing bitmap", e);
+                    handler.post(() -> isProcessingFrame = false);
+                }
+            } else {
+                Log.e("ARSceneView", "PixelCopy failed: " + result);
+                handler.post(() -> isProcessingFrame = false);
+            }
+        }, handler);
+    }
+
+    private void uploadImageToApi(String apiUrl, byte[] imageData) {
+        new Thread(() -> {
+            try {
+                String boundary = "Boundary-" + System.currentTimeMillis();
+                String lineEnd = "\r\n";
+                String twoHyphens = "--";
+
+                URL url = new URL(apiUrl);
+                HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+                connection.setRequestMethod("POST");
+                connection.setDoOutput(true);
+                connection.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
+
+                DataOutputStream outputStream = new DataOutputStream(connection.getOutputStream());
+                outputStream.writeBytes(twoHyphens + boundary + lineEnd);
+                outputStream.writeBytes("Content-Disposition: form-data; name=\"file\"; filename=\"frame.png\"" + lineEnd);
+                outputStream.writeBytes("Content-Type: image/png" + lineEnd);
+                outputStream.writeBytes(lineEnd);
+                outputStream.write(imageData);
+                outputStream.writeBytes(lineEnd);
+                outputStream.writeBytes(twoHyphens + boundary + twoHyphens + lineEnd);
+                outputStream.flush();
+                outputStream.close();
+
+                int responseCode = connection.getResponseCode();
+                String response = new java.util.Scanner(connection.getInputStream()).useDelimiter("\\A").next();
+                Log.d("ARSceneView", "Response Code: " + responseCode);
+                Log.d("ARSceneView", "Response Body: " + response);
+
+                handler.post(() -> isProcessingFrame = false);
+
+            } catch (Exception e) {
+                Log.e("ARSceneView", "Failed to send image to API", e);
+                handler.post(() -> isProcessingFrame = false);
+            }
+        }).start();
+    }
+
+    private void sendImageToApi(String apiUrl, byte[] imageData) {
+        new Thread(() -> {
+            try {
+                String boundary = "Boundary-" + System.currentTimeMillis();
+                String lineEnd = "\r\n";
+                String twoHyphens = "--";
+
+                URL url = new URL(apiUrl);
+                HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+                connection.setRequestMethod("POST");
+                connection.setDoOutput(true);
+                connection.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
+
+                DataOutputStream outputStream = new DataOutputStream(connection.getOutputStream());
+                outputStream.writeBytes(twoHyphens + boundary + lineEnd);
+                outputStream.writeBytes("Content-Disposition: form-data; name=\"file\"; filename=\"frame.png\"" + lineEnd);
+                outputStream.writeBytes("Content-Type: image/png" + lineEnd);
+                outputStream.writeBytes(lineEnd);
+                outputStream.write(imageData);
+                outputStream.writeBytes(lineEnd);
+                outputStream.writeBytes(twoHyphens + boundary + twoHyphens + lineEnd);
+                outputStream.flush();
+                outputStream.close();
+
+                int responseCode = connection.getResponseCode();
+                String response = new java.util.Scanner(connection.getInputStream()).useDelimiter("\\A").next();
+                Log.d("ARSceneView", "Response Code: " + responseCode);
+                Log.d("ARSceneView", "Response Body: " + response);
+
+                JSONObject json = new JSONObject(response);
+                JSONArray predictions = json.getJSONArray("predictions");
+
+                if (predictions.length() <= 1) {
+                    handler.post(() -> isProcessingFrame = false);
+                } else {
+                    float jackX = 0f;
+                    float jackY = 0f;
+                    float jackRadius = 0f;
+                    boolean isJackLast = false;
+
+                    for (int i = 0; i < predictions.length(); i++) {
+                        JSONObject prediction = predictions.getJSONObject(i);
+                        if (prediction.getString("class").equals("jack_ball")) {
+                            jackX = (float) prediction.getDouble("x");
+                            jackY = (float) prediction.getDouble("y");
+                            float jackWidth = (float) prediction.getDouble("width");
+                            float jackHeight = (float) prediction.getDouble("height");
+                            jackRadius = Math.max(jackWidth, jackHeight) / 2.0f;
+                            isJackLast = i == predictions.length() - 1;
+                            break;
+                        }
+                    }
+
+                    boolean isAllDistanceAdded = false;
+
+                    if (jackX != 0f && jackY != 0f) {
+                        for (int i = 0; i < predictions.length(); i++) {
+                            JSONObject prediction = predictions.getJSONObject(i);
+                            String className = prediction.getString("class");
+
+                            if (!className.equals("jack_ball")) {
+                                float x = (float) prediction.getDouble("x");
+                                float y = (float) prediction.getDouble("y");
+                                float playWidth = (float) prediction.getDouble("width");
+                                float playHeight = (float) prediction.getDouble("height");
+                                float playRadius = Math.max(playWidth, playHeight) / 2.0f;
+
+                                boolean isLastPlayBowl = isJackLast ? i == predictions.length() - 2 : i == predictions.length() - 1;
+
+                                float[] jackIntersectionResults = findCircleLineIntersection(jackX, jackY, jackRadius, jackX, jackY, x, y);
+                                float[] playIntersectionResults = findCircleLineIntersection(x, y, playRadius, x, y, jackX, jackY);
+
+                                if (jackIntersectionResults != null && playIntersectionResults != null) {
+                                    boolean isDistanceAdded = getDistance(jackIntersectionResults[0], jackIntersectionResults[1], playIntersectionResults[0], playIntersectionResults[1], isLastPlayBowl);
+
+                                    if (isDistanceAdded) {
+                                        isAllDistanceAdded = true;
+                                    }
+                                }
+
+
+                            }
+                        }
+
+                        if (!isAllDistanceAdded) {
+                            handler.post(() -> isProcessingFrame = false);
+                        }
+                    } else {
+                        handler.post(() -> isProcessingFrame = false);
+                    }
+                }
+            } catch (Exception e) {
+                Log.e("ARSceneView", "Failed to send image to API", e);
+                handler.post(() -> isProcessingFrame = false);
+            }
+        }).start();
+    }
+
+    public float[] findCircleLineIntersection(
+            float centerX, float centerY,
+            float radius,
+            float lineStartX, float lineStartY,
+            float lineEndX, float lineEndY
+    ) {
+        // Calculate the differences in x and y between the line endpoints
+        float dx = lineEndX - lineStartX;
+        float dy = lineEndY - lineStartY;
+
+        // Calculate the length of the line segment
+        float length = (float) Math.sqrt(dx * dx + dy * dy);
+        if (length == 0) {
+            // Line segment has zero length, return null
+            return null;
+        }
+
+        // Normalize the direction vector
+        float normalizedDx = dx / length;
+        float normalizedDy = dy / length;
+
+        // Calculate the intersection point on the circle's edge
+        float intersectionX = centerX + normalizedDx * radius;
+        float intersectionY = centerY + normalizedDy * radius;
+
+        return new float[]{intersectionX, intersectionY};
+    }
+
+    public boolean getDistance(float x1, float y1, float x2, float y2, boolean isLast) {
+        Frame frame = arFragment.getArSceneView().getArFrame();
+        if (frame == null) return false;
+
+        Anchor anchor1 = createAnchorNodeFromHit(x1, y1, frame);
+        Anchor anchor2 = createAnchorNodeFromHit(x2, y2, frame);
+
+        if (anchor1 == null || anchor2 == null) return false;
+
+
+        new Handler(Looper.getMainLooper()).post(() -> {
+            AnchorNode node1 = new AnchorNode(anchor1);
+            AnchorNode node2 = new AnchorNode(anchor2);
+
+            if (node1 == null || node2 == null) {
+                Log.e("ARScene", "AnchorNode creation failed");
+                return;
+            }
+
+            node1.setParent(arFragment.getArSceneView().getScene());
+            node2.setParent(arFragment.getArSceneView().getScene());
+
+            float distance = calculateDistanceBetweenNodes(node1, node2);
+            String distanceInCM = measureDistanceOf2Points(distance, isLast);
+
+            LocationMarker lMarker = new LocationMarker(this, anchor2);
+            lMarker.setTitle(distanceInCM);
+            lMarker.create();
+
+            Vector3 pointA = node1.getWorldPosition();
+            Vector3 pointB = node2.getWorldPosition();
+
+            drawRoundedLine(pointA, pointB);
+        });
+
+        return true;
+    }
+
+    private float calculateDistanceBetweenNodes(AnchorNode node1, AnchorNode node2) {
+        Vector3 pos1 = node1.getWorldPosition();
+        Vector3 pos2 = node2.getWorldPosition();
+        float dx = pos1.x - pos2.x;
+        float dy = pos1.y - pos2.y;
+        float dz = pos1.z - pos2.z;
+        return (float) Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    private String measureDistanceOf2Points(float distanceMeter, boolean isLast) {
+        String distanceText = String.format("%.2f cm", distanceMeter * 100);
+        distances.add(distanceText);
+        if (isLast) {
+            sendLabelsToJS(distances);
+            stopFrameProcessing();
+        }
+
+        return distanceText;
+    }
+
+    private Anchor createAnchorNodeFromHit(float x, float y, Frame frame) {
+        List<HitResult> hits = frame.hitTest(x, y);
+        for (HitResult hit : hits) {
+            if (hit.getTrackable() instanceof Plane) {
+                Anchor anchor = hit.createAnchor();
+                return anchor;
+            }
+        }
+        return null;
+    }
+
+    public void drawRoundedLine(Vector3 point1, Vector3 point2) {
+        Vector3 difference = Vector3.subtract(point2, point1);
+        Vector3 direction = difference.normalized();
+        float length = difference.length();
+
+        Scene scene = arFragment.getArSceneView().getScene();
+
+        // Create the renderable if not already
+        MaterialFactory.makeOpaqueWithColor(context, new Color(android.graphics.Color.RED))
+                .thenAccept(material -> {
+                    ModelRenderable lineRenderable = ShapeFactory.makeCube(
+                            new Vector3(0.01f, 0.01f, length), // small X/Y, length Z
+                            Vector3.zero(), material);
+
+                    // Center of the line
+                    Vector3 position = Vector3.add(point1, point2).scaled(0.5f);
+
+                    Node lineNode = new Node();
+                    lineNode.setRenderable(lineRenderable);
+                    lineNode.setWorldPosition(position);
+
+                    // Point line toward point2
+                    Quaternion rotation = Quaternion.lookRotation(direction, Vector3.up());
+                    lineNode.setWorldRotation(rotation);
+
+                    scene.addChild(lineNode);
+                });
+    }
 
   private void setOcclusionEnabled(boolean enabled){
     // TODO
@@ -138,13 +522,19 @@ public class ARScene extends FrameLayout implements BaseArFragment.OnTapArPlaneL
 
   public void onTapPlane(HitResult hitResult, Plane plane, MotionEvent motionEvent) {
     Anchor anchor = hitResult.createAnchor();
-    mAnchors.add(anchor);
-    int index = mAnchors.indexOf(anchor);
 
-    WritableMap event = Arguments.createMap();
-    event.putBoolean("onTapPlane", true);
-    event.putString("planeId", ""+index);
-    ModuleWithEmitter.sendEvent(context, ModuleWithEmitter.ON_TAP_PLANE, event);
+    LocationMarker lMarker = new LocationMarker(this, anchor);
+    lMarker.setTitle("hello");
+    lMarker.create();
+
+
+//    mAnchors.add(anchor);
+//    int index = mAnchors.indexOf(anchor);
+//
+//    WritableMap event = Arguments.createMap();
+//    event.putBoolean("onTapPlane", true);
+//    event.putString("planeId", ""+index);
+//    ModuleWithEmitter.sendEvent(context, ModuleWithEmitter.ON_TAP_PLANE, event);
   }
 
   public void addObject(ReadableMap object){
@@ -243,15 +633,24 @@ public class ARScene extends FrameLayout implements BaseArFragment.OnTapArPlaneL
   }
 
   public void hostCloudAnchor(int planeIndex) {
-    if(!mHosting){
-      if(arFragment !=null && arFragment.getArSceneView().getSession() != null) {
-        Anchor localAnchor = mAnchors.get(planeIndex);
-        if (localAnchor != null) {
-          mAnchorToHost = Objects.requireNonNull(arFragment.getArSceneView().getSession()).hostCloudAnchorWithTtl(localAnchor, 365);
-          mHosting = true;
-        }
+      startFrameProcessing();
+      Scene scene = arFragment.getArSceneView().getScene();
+
+      // Remove all children safely
+      List<Node> children = new ArrayList<>(scene.getChildren());
+
+      for (Node node : children) {
+          node.setRenderable(null);
       }
-    }
+//    if(!mHosting){
+//      if(arFragment !=null && arFragment.getArSceneView().getSession() != null) {
+//        Anchor localAnchor = mAnchors.get(planeIndex);
+//        if (localAnchor != null) {
+//          mAnchorToHost = Objects.requireNonNull(arFragment.getArSceneView().getSession()).hostCloudAnchorWithTtl(localAnchor, 365);
+//          mHosting = true;
+//        }
+//      }
+//    }
   }
 
   public void startVideoRecording(Promise promise) {
@@ -321,18 +720,18 @@ public class ARScene extends FrameLayout implements BaseArFragment.OnTapArPlaneL
       return;
     }
     setOcclusionEnabled(false);
-    if(mLocationMarkersData != null){
-      for(int index = 0; index < mLocationMarkersData.size(); index++){
-        ReadableMap element = mLocationMarkersData.getMap(index);
-        LocationMarker lMarker = new LocationMarker(this);
-        assert element != null;
-        lMarker.setTitle(element.getString("title"));
-        lMarker.setType(element.getBoolean("isAnchor"));
-        lMarker.setPos(element.getDouble("lng"), element.getDouble("lat"));
-        lMarker.create();
-      }
-      //Log.d("LocationMarkers", "Created " + locationScene.mLocationMarkers.size() + " markers");
-    }
+//    if(mLocationMarkersData != null){
+//      for(int index = 0; index < mLocationMarkersData.size(); index++){
+//        ReadableMap element = mLocationMarkersData.getMap(index);
+//        LocationMarker lMarker = new LocationMarker(this);
+//        assert element != null;
+//        lMarker.setTitle(element.getString("title"));
+//        lMarker.setType(element.getBoolean("isAnchor"));
+//        lMarker.setPos(element.getDouble("lng"), element.getDouble("lat"));
+//        lMarker.create();
+//      }
+//      //Log.d("LocationMarkers", "Created " + locationScene.mLocationMarkers.size() + " markers");
+//    }
     if (locationScene != null) {
       locationScene.refreshAnchors();
     }

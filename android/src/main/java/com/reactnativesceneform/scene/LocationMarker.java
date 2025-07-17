@@ -6,6 +6,8 @@ import android.widget.TextView;
 import android.widget.Toast;
 import androidx.appcompat.app.AppCompatActivity;
 import com.facebook.react.uimanager.ThemedReactContext;
+import com.google.ar.core.Anchor;
+import com.google.ar.sceneform.AnchorNode;
 import com.google.ar.sceneform.Node;
 import com.google.ar.sceneform.rendering.ViewRenderable;
 import com.reactnativesceneform.R;
@@ -23,18 +25,19 @@ public class LocationMarker {
   private double mLat;
   private ViewRenderable viewRenderable;
   private LocationScene mLocationScene;
-  private Node mNode;
+  private AnchorNode mNode;
   private uk.co.appoly.arcorelocation.LocationMarker mLocationMarker;
   private boolean isAnchor = false;
 
-  public LocationMarker(ARScene parent){
+  public LocationMarker(ARScene parent, Anchor arAnchor){
     mParent = parent;
     mContext = parent.context;
     mActivity = (AppCompatActivity) mContext.getCurrentActivity();
     mModelManager = parent.mModelManager;
     mLocationScene = parent.locationScene;
 
-    mNode = new Node();
+    mNode = new AnchorNode(arAnchor);
+    mNode.setParent(parent.arFragment.getArSceneView().getScene());
     //mNode.setRenderable(viewRenderable);
     Context c = mContext;
     mNode.setOnTapListener((v, event) -> {
@@ -69,7 +72,7 @@ public class LocationMarker {
             ((TextView)viewRenderable.getView()).setText(mTitle);
             this.viewRenderable = viewRenderable;
             mNode.setRenderable(viewRenderable);
-            place();
+//            place();
           }
         })
         .exceptionally(throwable -> {
